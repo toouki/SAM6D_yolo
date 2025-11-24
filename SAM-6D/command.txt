@@ -8,4 +8,4 @@ python Instance_Segmentation_Model/run_inference_custom.py --segmentor_model fas
 
 位姿估计
 
-python Pose_Estimation_Model/run_inference_custom.py --output_dir Data/Example/outputs --cad_path Data/Example/obj_000005.ply --rgb_path Data/Example/rgb.png --depth_path Data/Example/depth.png --cam_path Data/Example/camera.json --seg_path $SEG_PATH Data/Example/outputs/sam6d_results/detection_ism.json
+python Pose_Estimation_Model/run_inference_custom.py --output_dir Data/Example/outputs --cad_path Data/Example/obj_000005.ply --rgb_path Data/Example/rgb.png --depth_path Data/Example/depth.png --cam_path Data/Example/camera.json --seg_path Data/Example/outputs/sam6d_results/detection_ism.json
