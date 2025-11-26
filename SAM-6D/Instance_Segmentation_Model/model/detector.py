@@ -65,10 +65,6 @@ class Instance_Segmentation_Model(pl.LightningModule):
         self.visible_thred = visible_thred
         self.pointcloud_sample_num = pointcloud_sample_num
 
-        # 创建日志目录
-        os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(osp.join(self.log_dir, "predictions"), exist_ok=True)
-
         # 定义反向图像归一化变换（用于将归一化图像还原为原始像素值）
         self.inv_rgb_transform = T.Compose(
             [

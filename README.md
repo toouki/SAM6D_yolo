@@ -85,6 +85,7 @@ cd ../
 
 2. **渲染模版**
 ```bash
+cd SAM-6D
 blenderproc run ./Render/render_custom_templates.py \
 --output_dir Data/Example/outputs \
 --cad_path Data/Example/obj_000005.ply
@@ -92,6 +93,7 @@ blenderproc run ./Render/render_custom_templates.py \
 
 3. **实例分割**
 ```bash
+cd SAM-6D
 python Instance_Segmentation_Model/run_inference_custom.py \
 --segmentor_model fastsam \
 --output_dir Data/Example/outputs \
@@ -102,6 +104,7 @@ python Instance_Segmentation_Model/run_inference_custom.py \
 ```
 4. **位姿估计**
 ```bash
+cd SAM-6D
 python Pose_Estimation_Model/run_inference_custom.py \
 --output_dir Data/Example/outputs \
 --cad_path Data/Example/obj_000005.ply \
@@ -144,13 +147,12 @@ python Pose_Estimation_Model/run_inference_custom.py \
 ### 结果文件结构
 ```
 OUTPUT_DIR/
-├── sam6d_results/
-│   ├── detection_ism.json          # 实例分割结果
-│   ├── pose_estimation_results.json # 姿态估计结果
-│   ├── templates/                  # 渲染的模板图像
-│   └── visualizations/             # 可视化结果
-├── obj_000005_templates/           # CAD 模型模板
-└── logs/                           # 运行日志
+├── detection_ism.json              # 实例分割结果
+├── pose_estimation_results.json    # 姿态估计结果
+├── templates/                      # 渲染的模板图像
+├── vis_segmentation.png...         # 实例分割可视化结果
+├── vis_pose.png...                 # 姿态估计可视化结果
+└── descriptors/                    # CAD 特征描述符
 ```
 
 ### 姿态估计结果格式
@@ -167,7 +169,197 @@ OUTPUT_DIR/
 }
 ```
 
----  
+## 配置文件参数说明
+
+### 实例分割模型配置 (ISM)
+
+#### 主配置文件参数 (ISM_*.yaml)
+
+| 参数名 | 类型 | 默认值 |  说明  |
+|--------|------|--------|------|
+| `_target_` | str | model.detector.Instance_Segmentation_Model | 目标检测器类路径 |
+| `log_interval` | int | 5 | 日志输出间隔（迭代次数） |
+| `log_dir` | str | ${save_dir} | 日志保存目录 |
+| `segmentor_width_size` | int | 640 | 分割器输入图像宽度（保持稳定性） |
+| `descriptor_width_size` | int | 640 | 描述符网络输入图像宽度 |
+| `visible_thred` | float | 0.5 | 可见性阈值，用于过滤遮挡严重的物体 |
+| `pointcloud_sample_num` | int | 2048 | 点云采样数量 |
+
+#### 后处理配置 (post_processing_config)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `mask_post_processing.min_box_size` | float | 0.05 | 最小边界框尺寸（相对于图像尺寸） |
+| `mask_post_processing.min_mask_size` | float | 3e-4 | 最小掩码尺寸（相对于图像尺寸） |
+| `nms_thresh` | float | 0.25 | 非极大值抑制阈值 |
+
+#### 匹配配置 (matching_config)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `metric._target_` | str | model.loss.PairwiseSimilarity | 相似度计算类路径 |
+| `metric.metric` | str | cosine | 相似度度量类型（余弦相似度） |
+| `metric.chunk_size` | int | 16 | 分块处理大小，用于内存优化 |
+| `aggregation_function` | str | avg_5 | 聚合函数类型（平均5个最佳匹配） |
+| `confidence_thresh` | float | 0.2 | 置信度阈值，用于过滤低置信度匹配 |
+
+#### 初始化配置 (onboarding_config)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `rendering_type` | str | pbr | 模板渲染类型（基于物理渲染） |
+| `reset_descriptors` | bool | False | 是否重新计算描述符 |
+| `level_templates` | int | 0 | 模板密度级别（0=粗糙，1=中等，2=密集） |
+
+### 分割器模型配置
+
+#### SAM分割器 (segmentor_model/sam.yaml)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `_target_` | str | model.sam.CustomSamAutomaticMaskGenerator | SAM自动掩码生成器类路径 |
+| `points_per_batch` | int | 64 | 每批处理的点数量 |
+| `stability_score_thresh` | float | 0.85 | 稳定性分数阈值 |
+| `box_nms_thresh` | float | 0.7 | 边界框NMS阈值 |
+| `min_mask_region_area` | int | 0 | 最小掩码区域面积（像素） |
+| `pred_iou_thresh` | float | 0.88 | 预测IoU阈值 |
+| `sam.model_type` | str | vit_h | SAM模型类型（vit_h/vit_l/vit_b） |
+| `sam.checkpoint_dir` | str | ./checkpoints/segment-anything/ | SAM模型检查点目录 |
+
+#### YOLOv11分割器 (segmentor_model/yolov11seg.yaml)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `_target_` | str | model.yolov11_seg.Yolov11Seg | YOLOv11分割器类路径 |
+| `checkpoint_path` | str | ./checkpoints/yolov11/best.pt | 模型权重文件路径 |
+| `config.iou_threshold` | float | 0.5 | IoU阈值，用于NMS |
+| `config.conf_threshold` | float | 0.25 | 置信度阈值 |
+| `config.max_det` | int | 200 | 最大检测数量 |
+
+#### FastSAM分割器 (segmentor_model/fast_sam.yaml)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `_target_` | str | model.fast_sam.CustomFastSAM | FastSAM分割器类路径 |
+| `checkpoint_path` | str | ./checkpoints/FastSAM/ | FastSAM模型检查点目录 |
+| `model_type` | str | FastSAM-x | FastSAM模型类型 |
+
+### 描述符模型配置
+
+#### DINOv2描述器 (descriptor_model/dinov2.yaml)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `_target_` | str | model.dinov2.CustomDINOv2 | DINOv2描述器类路径 |
+| `model_name` | str | dinov2_vitl14 | DINOv2模型名称（ViT-L/14） |
+| `checkpoint_dir` | str | ./checkpoints/dinov2 | DINOv2模型检查点目录 |
+| `token_name` | str | x_norm_clstoken | 使用的token类型 |
+| `image_size` | int | 224 | 输入图像尺寸 |
+| `chunk_size` | int | 16 | 分块处理大小 |
+| `validpatch_thresh` | float | 0.5 | 有效patch阈值 |
+
+### 姿态估计模型配置 (PEM)
+
+#### 优化器配置 (optimizer)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `type` | str | Adam | 优化器类型 |
+| `lr` | float | 0.0001 | 学习率 |
+| `betas` | list | [0.5, 0.999] | Adam优化器的beta参数 |
+| `eps` | float | 0.000001 | 数值稳定性参数 |
+| `weight_decay` | float | 0.0 | 权重衰减系数 |
+
+#### 学习率调度器 (lr_scheduler)
+
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `type` | str | WarmupCosineLR | 学习率调度器类型 |
+| `max_iters` | int | 600000 | 最大迭代次数 |
+| `warmup_factor` | float | 0.001 | 预热因子 |
+| `warmup_iters` | int | 1000 | 预热迭代次数 |
+
+#### 模型架构配置 (model)
+
+**特征提取模块 (feature_extraction)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `vit_type` | str | vit_base | Vision Transformer类型 |
+| `up_type` | str | linear | 上采样类型 |
+| `embed_dim` | int | 768 | 嵌入维度 |
+| `out_dim` | int | 256 | 输出特征维度 |
+| `use_pyramid_feat` | bool | True | 是否使用金字塔特征 |
+| `pretrained` | bool | True | 是否使用预训练权重 |
+
+**几何嵌入模块 (geo_embedding)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `sigma_d` | float | 0.2 | 距离嵌入的标准差 |
+| `sigma_a` | float | 15 | 角度嵌入的标准差 |
+| `angle_k` | int | 3 | 角度嵌入的k近邻数 |
+| `reduction_a` | str | max | 角度特征的聚合方式 |
+| `hidden_dim` | int | 256 | 隐藏层维度 |
+
+**粗粒度点匹配 (coarse_point_matching)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `nblock` | int | 3 | Transformer块数量 |
+| `input_dim` | int | 256 | 输入特征维度 |
+| `hidden_dim` | int | 256 | 隐藏层维度 |
+| `out_dim` | int | 256 | 输出特征维度 |
+| `temp` | float | 0.1 | 温度参数，用于softmax |
+| `sim_type` | str | cosine | 相似度计算类型 |
+| `normalize_feat` | bool | True | 是否归一化特征 |
+| `loss_dis_thres` | float | 0.15 | 距离损失阈值 |
+| `nproposal1` | int | 6000 | 第一阶段候选数量 |
+| `nproposal2` | int | 300 | 第二阶段候选数量 |
+
+**细粒度点匹配 (fine_point_matching)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `nblock` | int | 3 | Transformer块数量 |
+| `input_dim` | int | 256 | 输入特征维度 |
+| `hidden_dim` | int | 256 | 隐藏层维度 |
+| `out_dim` | int | 256 | 输出特征维度 |
+| `pe_radius1` | float | 0.1 | 第一阶段位置编码半径 |
+| `pe_radius2` | float | 0.2 | 第二阶段位置编码半径 |
+| `focusing_factor` | int | 3 | 聚焦因子 |
+| `temp` | float | 0.1 | 温度参数 |
+| `sim_type` | str | cosine | 相似度计算类型 |
+| `normalize_feat` | bool | True | 是否归一化特征 |
+| `loss_dis_thres` | float | 0.15 | 距离损失阈值 |
+
+#### 数据集配置
+
+**训练数据集 (train_dataset)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `data_dir` | str | ../Data/MegaPose-Training-Data | 训练数据目录 |
+| `img_size` | int | 224 | 输入图像尺寸 |
+| `n_sample_observed_point` | int | 2048 | 观测点采样数量 |
+| `n_sample_model_point` | int | 2048 | 模型点采样数量 |
+| `n_sample_template_point` | int | 5000 | 模板点采样数量 |
+| `min_visib_fract` | float | 0.1 | 最小可见性比例 |
+| `min_px_count_visib` | int | 512 | 最小可见像素数量 |
+| `shift_range` | float | 0.01 | 数据增强的平移范围 |
+| `rgb_mask_flag` | bool | True | 是否使用RGB掩码 |
+| `dilate_mask` | bool | True | 是否膨胀掩码 |
+
+**测试数据集 (test_dataset)**
+| 参数名 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `data_dir` | str | ../Data/BOP | 测试数据目录 |
+| `template_dir` | str | ../Data/BOP-Templates | 模板目录 |
+| `img_size` | int | 224 | 输入图像尺寸 |
+| `n_sample_observed_point` | int | 2048 | 观测点采样数量 |
+| `n_sample_model_point` | int | 1024 | 模型点采样数量 |
+| `n_sample_template_point` | int | 5000 | 模板点采样数量 |
+| `minimum_n_point` | int | 8 | 最小点数量 |
+| `rgb_mask_flag` | bool | True | 是否使用RGB掩码 |
+| `seg_filter_score` | float | 0.25 | 分割过滤分数 |
+| `n_template_view` | int | 42 | 模板视图数量 |
+
+---
 
 # <p align="center"> <font color=#008000>SAM-6D</font>: Segment Anything Model Meets Zero-Shot 6D Object Pose Estimation </p>
 

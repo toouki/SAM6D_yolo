@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.utils.model_zoo as model_zoo
 from functools import partial
+import logging
 import timm.models.vision_transformer
 from model_utils import (
     LayerNorm2d,
@@ -11,6 +12,9 @@ from model_utils import (
     get_chosen_pixel_feats,
     sample_pts_feats
 )
+
+# 设置日志记录器
+logger = logging.getLogger(__name__)
 
 
 
@@ -83,12 +87,12 @@ class ViT_AE(nn.Module):
                 model_zoo.load_url('https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_'+ self.vit_type +'.pth', 'checkpoints')
 
             checkpoint = torch.load(vit_checkpoint, map_location='cpu')
-            print("load pre-trained checkpoint from: %s" % vit_checkpoint)
+            logger.info("load pre-trained checkpoint from: %s" % vit_checkpoint)
             checkpoint_model = checkpoint['model']
             state_dict = self.vit.state_dict()
             for k in ['head.weight', 'head.bias']:
                 if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint")
+                    logger.info(f"Removing key {k} from pretrained checkpoint")
                     del checkpoint_model[k]
             # interpolate position embedding
             interpolate_pos_embed(self.vit, checkpoint_model)

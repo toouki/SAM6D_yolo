@@ -1,6 +1,6 @@
 # configs/model/segmentor_model/yolov11_seg.yaml
 _target_: model.yolov11_seg.Yolov11Seg
-checkpoint_path: ./Instance_Segmentation_Model/checkpoints/yolov11/your_yolov11seg_model.pt  # 你的模型路径
+checkpoint_path: ./Instance_Segmentation_Model/checkpoints/yolov11/best.pt  # 你的模型路径
 segmentor_width_size: ${model.segmentor_width_size}  # 复用全局宽度配置（如640）
 config:
   iou_threshold: 0.5  # 根据模型性能调整
