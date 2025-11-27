@@ -80,11 +80,15 @@ class ViT_AE(nn.Module):
             assert False
 
         if self.pretrained:
-            vit_checkpoint = os.path.join('checkpoints', 'mae_pretrain_'+ self.vit_type +'.pth')
-            if not os.path.isdir(vit_checkpoint):
-                if not os.path.isdir('checkpoints'):
-                    os.makedirs('checkpoints')
-                model_zoo.load_url('https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_'+ self.vit_type +'.pth', 'checkpoints')
+            # 获取当前文件的绝对路径，然后构建正确的checkpoints路径
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            checkpoints_dir = os.path.join(os.path.dirname(current_dir), 'checkpoints')  # Pose_Estimation_Model/checkpoints
+            vit_checkpoint = os.path.join(checkpoints_dir, 'mae_pretrain_'+ self.vit_type +'.pth')
+            
+            if not os.path.isfile(vit_checkpoint):
+                if not os.path.isdir(checkpoints_dir):
+                    os.makedirs(checkpoints_dir)
+                model_zoo.load_url('https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_'+ self.vit_type +'.pth', checkpoints_dir)
 
             checkpoint = torch.load(vit_checkpoint, map_location='cpu')
             logger.info("load pre-trained checkpoint from: %s" % vit_checkpoint)
