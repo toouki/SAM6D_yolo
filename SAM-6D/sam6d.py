@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 from typing import Optional, List, Dict, Any
 import numpy as np
 import torch
@@ -11,8 +10,6 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import logging
 import time
-from skimage.feature import canny  # 边缘检测
-from skimage.morphology import binary_dilation  # 二值膨胀操作
 
 # 添加ISM相关路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Instance_Segmentation_Model'))
@@ -21,9 +18,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'Pose_Estimation_Model')
 # ISM相关导入
 from Instance_Segmentation_Model.utils.poses.pose_utils import get_obj_poses_from_template_level, load_index_level_in_level2
 from Instance_Segmentation_Model.utils.bbox_utils import CropResizePad
-from Instance_Segmentation_Model.model.utils import Detections, convert_npz_to_json
-from Instance_Segmentation_Model.utils.inout import load_json, save_json_bop23, save_torch, load_torch
-from Instance_Segmentation_Model.utils.data_utils import rle_to_binary_mask as rle_to_mask  # RLE编码转掩码
+from Instance_Segmentation_Model.model.utils import Detections
+from Instance_Segmentation_Model.utils.inout import load_json, save_torch, load_torch
 
 # 添加PEM模型路径到系统路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'Pose_Estimation_Model', 'model'))
@@ -38,6 +34,8 @@ import imageio.v2 as imageio
 from Pose_Estimation_Model.utils.draw_utils import draw_detections
 import pycocotools.mask as cocomask
 import torchvision.transforms as transforms
+import colorsys
+import distinctipy
 
 # 常量定义
 DEFAULT_MODEL_POINTS = 2048  # CAD模型采样点云的默认点数
@@ -57,6 +55,35 @@ rgb_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+def generate_distinct_colors(n_colors: int) -> List[tuple]:
+    """
+    生成视觉上可区分的颜色列表
+    
+    Args:
+        n_colors: 需要的颜色数量
+        
+    Returns:
+        颜色列表，每个颜色为(R,G,B)元组，值范围0-255
+    """
+    if n_colors <= 0:
+        return []
+    
+    try:
+        # 优先使用distinctipy库生成视觉上可区分的颜色
+        colors = distinctipy.get_colors(n_colors)
+        # 转换为0-255范围的RGB元组
+        return [(int(c[0]*255), int(c[1]*255), int(c[2]*255)) for c in colors]
+    except ImportError:
+        # 如果distinctipy不可用，使用HSV色彩空间生成颜色
+        colors = []
+        for i in range(n_colors):
+            hue = i / n_colors
+            saturation = 0.8 + (i % 2) * 0.2  # 交替使用0.8和1.0的饱和度
+            value = 0.8 + (i % 3) * 0.067   # 在0.8-1.0之间变化亮度
+            rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+            colors.append((int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)))
+        return colors
+
 
 class PoseEstimationDetector:
     """
@@ -74,7 +101,8 @@ class PoseEstimationDetector:
                 det_score_thresh: float = 0.2, 
                 reset_descriptors: bool = True, 
                 visualization: bool = False,
-                verbose: bool = False) -> None:
+                verbose: bool = False,
+                save_results: bool = True) -> None:
         """
         初始化姿态估计检测器
         
@@ -88,6 +116,7 @@ class PoseEstimationDetector:
             reset_descriptors: 是否重新计算描述符
             visualization: 是否启用可视化功能
             verbose: 是否启用详细日志输出
+            save_results: 是否保存中间结果文件，False可加速计算
         """
         self.segmentor_model = segmentor_model
         self.pem_checkpoint = pem_checkpoint or os.path.join(
@@ -102,6 +131,7 @@ class PoseEstimationDetector:
         self.reset_descriptors = reset_descriptors
         self.visualization = visualization
         self.verbose = verbose
+        self.save_results = save_results
         
         # 根据verbose参数设置日志级别
         if verbose:
@@ -364,17 +394,12 @@ class PoseEstimationDetector:
             all_tem_pts.append(torch.FloatTensor(tem_pts).unsqueeze(0).cuda())
         return all_tem, all_tem_pts, all_tem_choose
 
-    def _get_det_data(self, rgb_path, depth_path, seg_path, det_score_thresh, cfg):
-        """获取测试数据"""
-        dets = []
-        # 加载分割结果JSON文件
-        with open(seg_path) as f:
-            dets_ = json.load(f)
+
+    
+    def _get_det_data(self, rgb_path, depth_path, detections, det_score_thresh, cfg):
+        """从内存中的检测结果获取测试数据（避免文件I/O）"""
         # 过滤掉分数低于阈值的检测结果
-        for det in dets_:
-            if det['score'] > det_score_thresh:
-                dets.append(det)
-        del dets_
+        dets = [det for det in detections if det['score'] > det_score_thresh]
 
         # 使用缓存数据（避免重复读取）
         image_data = self._load_image_data(rgb_path, depth_path)
@@ -558,31 +583,13 @@ class PoseEstimationDetector:
                 templates, masks_cropped[:, 0, :, :]
             ).unsqueeze(0).data
             save_torch(self.ref_data["appe_descriptors"], appe_desc_path)
-    def _visualize_pose(self, rgb, pred_rot, pred_trans, model_points, K, save_path):
-        """可视化单个实例的检测结果"""
-        # 将单个实例的姿态包装成列表以适应draw_detections函数
-        img = draw_detections(rgb, [pred_rot], [pred_trans], model_points, [K], color=(255, 0, 0))
-        # 将绘制结果转为PILPIL图像并保存
-        img = Image.fromarray(np.uint8(img))
-        img.save(save_path)
-        # 读取保存的预测结果图像
-        prediction = Image.open(save_path)
-        
-        # 并排拼接原图和预测结果
-        rgb = Image.fromarray(np.uint8(rgb))  # 原图转为PIL图像
-        img = np.array(img)  # 预测结果转为numpy数组
-        # 创建拼接图像（宽度为两者之和，高度为原图高度）
-        concat = Image.new('RGB', (img.shape[1] + prediction.size[0], img.shape[0]))
-        concat.paste(rgb, (0, 0))  # 粘贴原图到左侧
-        concat.paste(prediction, (img.shape[1], 0))  # 粘贴预测结果到右侧
-        return concat
 
-    def _batch_input_data(self, depth_path, cam_path, device):
+    def _batch_input_data(self, depth_array, cam_path, device):
         """
         处理深度图和相机参数，转换为模型输入的批次数据格式
         
         参数:
-            depth_path: 深度图像路径
+            depth_array: 深度图像数组
             cam_path: 相机参数文件(json)路径
             device: 计算设备(cpu/cuda)
         返回:
@@ -594,11 +601,8 @@ class PoseEstimationDetector:
         if self.cam_info is None:
             self.cam_info = load_json(cam_path)
         
-        # 使用缓存数据（避免重复读取深度图）
-        if self._current_depth is None or self._current_depth_path != depth_path:
-            # 如果缓存中没有数据，则加载
-            self._current_depth = np.array(imageio.imread(depth_path)).astype(np.int32)
-            self._current_depth_path = depth_path
+        # 直接使用传入的深度数据
+        depth_data = depth_array.astype(np.int32)
         
         # 解析相机内参(3x3矩阵)
         cam_K = np.array(self.cam_info['cam_K']).reshape((3, 3))
@@ -606,7 +610,7 @@ class PoseEstimationDetector:
         depth_scale = np.array(self.cam_info['depth_scale'])
 
         # 转换为torch张量，增加批次维度，并移动到目标设备
-        batch["depth"] = torch.from_numpy(self._current_depth).unsqueeze(0).to(device)
+        batch["depth"] = torch.from_numpy(depth_data).unsqueeze(0).to(device)
         batch["cam_intrinsic"] = torch.from_numpy(cam_K).unsqueeze(0).to(device)
         batch['depth_scale'] = torch.from_numpy(depth_scale).unsqueeze(0).to(device)
         return batch
@@ -801,19 +805,19 @@ class PoseEstimationDetector:
         choose = (np.floor(row_idx * ratio_h) * img_size + np.floor(col_idx * ratio_w)).astype(np.int64)
         return choose
         
-    def run_instance_segmentation(self, rgb_path, depth_path):
+    def run_instance_segmentation(self, rgb_array, depth_array):
         """
         运行实例分割
         
         Args:
-            rgb_path: RGB图像路径
-            depth_path: 深度图像路径
+            rgb_array: RGB图像数组
+            depth_array: 深度图像数组
             
         Returns:
             detections: 检测结果
         """
         if self.verbose:
-            logger.info(f"运行实例分割: {rgb_path}")
+            logger.info("运行实例分割")
         
         # 检查必要参数
         if not self.cam_path:
@@ -822,10 +826,6 @@ class PoseEstimationDetector:
             raise ValueError("初始化时必须提供cad_path参数") 
         if not self.output_dir:
             raise ValueError("初始化时必须提供output_dir参数")
-        
-        # 使用缓存数据（避免重复读取）
-        image_data = self._load_image_data(rgb_path, depth_path)
-        rgb_array = image_data['rgb_array']
         
         # 生成掩码
         detections = self.ism_model.segmentor_model.generate_masks(rgb_array)
@@ -850,7 +850,7 @@ class PoseEstimationDetector:
         )
         
         # 处理深度和相机数据，准备几何分数计算
-        batch = self._batch_input_data(depth_path, self.cam_path, self.device)
+        batch = self._batch_input_data(depth_array, self.cam_path, self.device)
         # 获取模板的姿态分布(用于投影计算)
         template_poses = get_obj_poses_from_template_level(level=2, pose_distribution="all")
         template_poses[:, :3, 3] *= 0.4  # 缩放平移分量(可能是单位转换)
@@ -884,14 +884,143 @@ class PoseEstimationDetector:
         
         return detections, query_appe_descriptors, best_template, pred_idx_objects, ref_aux_descriptor
     
-    def run_pose_estimation(self, rgb_path, depth_path, seg_path, det_score_thresh=0.2):
+
+    
+    def _get_det_data(self, rgb_array, depth_array, whole_pts, detections, det_score_thresh, cfg):
+        """直接从传入的数组和ISM的Detections对象获取测试数据（避免文件I/O和格式转换）"""
+        # 过滤掉分数低于阈值的检测结果
+        valid_indices = []
+        if hasattr(detections, 'scores'):
+            scores = detections.scores.cpu().numpy()
+            valid_indices = [i for i, score in enumerate(scores) if score > det_score_thresh]
+        else:
+            # 如果没有分数，保留所有检测
+            valid_indices = list(range(len(detections)))
+
+        # 直接使用传入的数据
+        whole_image = rgb_array
+        whole_depth = depth_array.astype(np.float32) * self.cam_info['depth_scale'] / 1000.0
+        
+        # 使用预加载的相机参数
+        K = np.array(self.cam_info['cam_K']).reshape(3, 3)
+
+        # 使用预加载的CAD模型点云
+        if self.model_points is None:
+            mesh = trimesh.load_mesh(self.cad_path)
+            self.model_points = mesh.sample(cfg.n_sample_model_point).astype(np.float32) / 1000.0
+        model_points = self.model_points
+        radius = np.max(np.linalg.norm(model_points, axis=1))
+
+        # 存储处理后的测试数据
+        all_rgb = []
+        all_cloud = []
+        all_rgb_choose = []
+        all_score = []
+        all_dets = []
+
+        # 遍历每个有效检测实例
+        for i in valid_indices:
+            # 直接从Detections对象获取数据
+            if hasattr(detections, 'masks') and hasattr(detections, 'scores'):
+                mask = detections.masks[i].cpu().numpy()
+                score = float(detections.scores[i].cpu().numpy())
+                bbox = detections.boxes[i].cpu().numpy() if hasattr(detections, 'boxes') else None
+            else:
+                continue
+
+            # 直接使用二值掩码，无需RLE转换
+            mask = np.logical_and(mask > 0, whole_depth > 0)
+            
+            if np.sum(mask) > MIN_MASK_PIXELS:
+                bbox_coords = self._get_bbox(mask)
+                y1, y2, x1, x2 = bbox_coords
+            else:
+                continue
+
+            # 根据边界框裁剪掩码
+            mask = mask[y1:y2, x1:x2]
+            # 获取掩码中非零区域的索引（展平后）
+            choose = mask.astype(np.float32).flatten().nonzero()[0]
+            
+            # 检查choose是否为空
+            if len(choose) == 0:
+                logger.warning("掩码中没有有效像素，跳过该实例")
+                continue
+
+            # 处理点云
+            cloud = whole_pts[y1:y2, x1:x2, :].reshape((-1, 3))[choose, :]
+            
+            # 计算点云中心
+            center = np.mean(cloud, axis=0)
+            # 点云去中心化
+            tmp_cloud = cloud - center[None, :]
+            # 过滤离群点
+            flag = np.linalg.norm(tmp_cloud, axis=1) < radius * 1.2
+            
+            # 根据过滤结果更新索引和点云
+            choose = choose[flag]
+            cloud = cloud[flag]
+
+            # 采样观测点（确保数量为配置的n_sample_observed_point）
+            if len(choose) <= cfg.n_sample_observed_point:
+                choose_idx = np.random.choice(np.arange(len(choose)), cfg.n_sample_observed_point)
+            else:
+                choose_idx = np.random.choice(np.arange(len(choose)), cfg.n_sample_observed_point, replace=False)
+            choose = choose[choose_idx]
+            cloud = cloud[choose_idx]
+
+            # 处理RGB图像
+            rgb = whole_image[y1:y2, x1:x2, :][:,:,::-1]  # BGR to RGB
+            if cfg.rgb_mask_flag:
+                rgb = rgb * (mask[:,:,None]>0).astype(np.uint8)
+            
+            rgb = cv2.resize(rgb, (cfg.img_size, cfg.img_size), interpolation=cv2.INTER_LINEAR)
+            rgb = rgb_transform(np.array(rgb))
+            
+            # 获取resize后RGB图像中对应采样点的索引
+            rgb_choose = self._get_resize_rgb_choose(choose, [y1, y2, x1, x2], cfg.img_size)
+
+            # 创建检测结果字典（保持与原始格式兼容）
+            detection_dict = {
+                'score': score,
+                'segmentation': {'size': mask.shape, 'counts': None},  # 标记格式
+                'bbox': bbox.tolist() if bbox is not None else [x1, y1, x2-x1, y2-y1],
+                'K': K.tolist()  # 添加相机内参
+            }
+
+            # 添加到列表
+            all_rgb.append(torch.FloatTensor(rgb))
+            all_cloud.append(torch.FloatTensor(cloud))
+            all_rgb_choose.append(torch.IntTensor(rgb_choose).long())
+            all_score.append(score)
+            all_dets.append(detection_dict)
+
+        # 构建输入数据
+        input_data = {}
+        if len(all_rgb) > 0:
+            input_data['rgb'] = torch.stack(all_rgb).cuda()
+            input_data['pts'] = torch.stack(all_cloud).cuda()
+            input_data['rgb_choose'] = torch.stack(all_rgb_choose).cuda()
+            input_data['score'] = torch.FloatTensor(all_score).cuda()
+
+            # 获取实例数量
+            ninstance = len(all_rgb)
+            # 复制模型点云，适配批次维度
+            input_data['model'] = torch.FloatTensor(model_points).unsqueeze(0).repeat(ninstance, 1, 1).cuda()
+            # 复制相机内参，适配批次维度
+            input_data['K'] = torch.FloatTensor(K).unsqueeze(0).repeat(ninstance, 1, 1).cuda()
+        
+        return input_data, whole_image, whole_pts.reshape(-1, 3), model_points, all_dets
+
+    def run_pose_estimation(self, rgb_array, depth_array, whole_pts, detections, det_score_thresh=0.2):
         """
-        运行姿态估计
+        从ISM检测结果运行姿态估计（合并后的完整方法）
         
         Args:
-            rgb_path: RGB图像路径
-            depth_path: 深度图像路径
-            seg_path: 分割结果路径
+            rgb_array: RGB图像数组
+            depth_array: 深度图像数组
+            whole_pts: 完整点云数据
+            detections: ISM的Detections对象
             det_score_thresh: 检测分数阈值
             
         Returns:
@@ -904,11 +1033,12 @@ class PoseEstimationDetector:
         if not self.cam_path or not self.cad_path:
             raise ValueError("初始化时必须提供cam_path, cad_path参数")
         
-        # 加载分割数据
-        input_data, img, _, model_points, detections = self._get_det_data(
-            rgb_path, depth_path, seg_path, det_score_thresh, self.pem_config.test_dataset
+        # 直接使用传入的数据，避免重复读取
+        input_data, img, _, model_points, detections_list = self._get_det_data(
+            rgb_array, depth_array, whole_pts, detections, det_score_thresh, self.pem_config.test_dataset
         )
         
+        # 姿态估计核心逻辑
         ninstance = input_data['pts'].size(0) if 'pts' in input_data else 0
         if ninstance == 0:
             logger.warning("没有找到有效的实例")
@@ -953,8 +1083,8 @@ class PoseEstimationDetector:
                 'score': float(pose_scores[idx]),
                 'rotation': pred_rot[idx].tolist(),
                 'translation': pred_trans[idx].tolist(),
-                'bbox': detections[idx]['bbox'],
-                'detection': detections[idx]
+                'bbox': detections_list[idx]['bbox'],
+                'detection': detections_list[idx]
             }
             results.append(result)
         
@@ -962,9 +1092,11 @@ class PoseEstimationDetector:
             logger.info(f"姿态估计完成，检测到 {len(results)} 个实例")
         return results, img, model_points  # 保持米为单位，在可视化时再转换
     
+
+    
     def detect(self, rgb_path: str, depth_path: str) -> List[Dict[str, Any]]:
         """
-        完整的6D物体姿态检测流程
+        完整的6D物体姿态检测流程（仅使用内存方式）
         
         Args:
             rgb_path: RGB图像路径
@@ -975,7 +1107,7 @@ class PoseEstimationDetector:
             results: 检测和姿态估计结果
         """
         if self.verbose:
-            logger.info("开始完整的6D姿态检测流程...")
+            logger.info("开始完整的6D姿态检测流程（内存方式）...")
         
         # 检查必要参数
         if not self.output_dir:
@@ -990,29 +1122,30 @@ class PoseEstimationDetector:
         if self.pem_model is None:
             self.init_pem_model()
         
-        # 步骤1: 实例分割
-        detections, _, _, _, _ = self.run_instance_segmentation(rgb_path, depth_path)
+        # 一次性加载所有图像数据，避免后续重复读取
+        image_data = self._load_image_data(rgb_path, depth_path)
+        rgb_array = image_data['rgb_array']
+        depth_array = image_data['depth_array']
+        whole_pts = image_data['whole_pts']
+        
+        # 步骤1: 实例分割（传入RGB数组而非路径）
+        detections, _, _, _, _ = self.run_instance_segmentation(rgb_array, depth_array)
         
         if len(detections) == 0:
             logger.warning("ISM未检测到任何物体")
             return []
         
-        # 保存ISM分割结果
-        detections.to_numpy()
-        ism_save_path = f"{self.output_dir}/detection_ism"
-        detections.save_to_file(0, 0, 0, ism_save_path, "Custom", return_results=False)
-        detections_json = convert_npz_to_json(idx=0, list_npz_paths=[ism_save_path + ".npz"])
-        save_json_bop23(ism_save_path + ".json", detections_json)
-        
-        # 步骤2: 姿态估计
-        seg_path = ism_save_path + ".json"
+        # 步骤2: 姿态估计（传入预处理的数据而非路径）
         pose_results, img, model_points = self.run_pose_estimation(
-            rgb_path, depth_path, seg_path, self.det_score_thresh
+            rgb_array, depth_array, whole_pts, detections, self.det_score_thresh
         )
         
         # 步骤3: 可视化结果（如果启用）
         if self.visualization:
-            self._visualize_results(pose_results, img, model_points, self.output_dir)
+            # 可视化实例分割结果
+            self._visualize_seg(rgb_array, detections, self.output_dir)
+            # 可视化姿态估计结果
+            self._visualize_poses(img, pose_results, model_points, self.output_dir)
         else:
             if self.verbose:
                 logger.info("可视化功能已禁用，跳过可视化步骤")
@@ -1021,87 +1154,180 @@ class PoseEstimationDetector:
             logger.info(f"6D姿态检测完成，共检测到 {len(pose_results)} 个物体实例")
         return pose_results
     
-    def _visualize_results(self, pose_results, img, model_points, output_dir):
-        """可视化检测结果"""
-        if self.verbose:
-            logger.info("生成可视化结果...")
+    def _visualize_poses(self, rgb_image, pose_results, model_points, output_dir=None):
+        """统一的姿态估计结果可视化函数
         
-        for idx, result in enumerate(pose_results):
-            # 1. 可视化实例分割结果
-            seg_save_path = os.path.join(output_dir, f"vis_segmentation_instance_{idx}_score_{result['score']:.4f}.png")
-            self._visualize_segmentation(result['detection'], img, seg_save_path)
+        Args:
+            rgb_image: RGB图像数组或PIL图像
+            pose_results: 姿态估计结果列表
+            model_points: CAD模型点云数据
+            output_dir: 输出目录路径，如果为None则不保存结果
             
-            # 2. 可视化姿态估计结果
-            pose_save_path = os.path.join(output_dir, f"vis_pose_instance_{idx}_score_{result['score']:.4f}.png")
-            
-            # 获取相机内参（从输入数据中获取）
-            # 注意：model_points需要转为毫米单位，与参考实现保持一致
-            vis_img = self._visualize_pose(
-                img, 
-                np.array(result['rotation']), 
-                np.array(result['translation']), 
-                model_points * 1000,  # 从米转为毫米
-                np.array(result['detection']['K']).reshape(3, 3),  # 使用每个实例的相机内参
-                pose_save_path
-            )
-            vis_img.save(pose_save_path)
-            
+        Returns:
+            concat_img: 拼接后的可视化图像，如果失败返回None
+        """
+        if not pose_results:
             if self.verbose:
-                logger.info(f"已保存实例 {idx} 的可视化结果")
+                logger.warning("没有姿态估计结果，跳过可视化")
+            return None
+        
+        # 确保输入格式正确
+        if isinstance(rgb_image, Image.Image):
+            rgb_image = np.array(rgb_image)
+        
+        # 获取相机内参
+        if self.cam_info is None:
+            logger.error("相机参数未加载，无法可视化")
+            return None
+        
+        K = np.array(self.cam_info['cam_K']).reshape(3, 3)
+        
+        try:
+            # 提取所有旋转和平移矩阵
+            pred_rotations = []
+            pred_translations = []
+            
+            for result in pose_results:
+                pred_rot = np.array(result['rotation'])
+                pred_trans = np.array(result['translation']) / 1000.0  # 转为米单位
+                pred_rotations.append(pred_rot)
+                pred_translations.append(pred_trans)
+            
+            # 确保RGB图像是uint8类型且范围在[0, 255]
+            if rgb_image.dtype != np.uint8:
+                rgb_image_display = (rgb_image * 255).astype(np.uint8)
+            else:
+                rgb_image_display = rgb_image.copy()
+            
+            # 为每个姿态估计结果生成足够的颜色
+            num_poses = len(pose_results)
+            colors = generate_distinct_colors(max(num_poses, 6))  # 至少生成6种颜色
+            
+            # 初始化绘制图像
+            img_with_poses = rgb_image_display.copy()
+            
+            # 直接在图像上绘制每个姿态估计结果，不使用半透明
+            for i, result in enumerate(pose_results):
+                color = colors[i]
+                
+                # 直接在主图像上绘制当前姿态估计结果
+                img_with_poses = draw_detections(
+                    img_with_poses,
+                    [np.array(result['rotation'])],
+                    [np.array(result['translation']) / 1000.0],  # 转为米单位
+                    model_points,
+                    [K],
+                    color=color
+                )
+            
+            # 在姿态结果图像上添加分数标签
+            for i, result in enumerate(pose_results):
+                score = result['score']
+                color = colors[i % len(colors)]
+                label = f"Pose {i}: {score:.3f}"
+                
+                # 添加标签背景和文字
+                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                # 右上角显示标签
+                label_x = img_with_poses.shape[1] - w - 10
+                label_y = 30 + i * 30
+                # 使用半透明背景而不是黑色背景
+                overlay = img_with_poses.copy()
+                cv2.rectangle(overlay, (label_x - 5, label_y - h), (label_x + w + 5, label_y + 5), (255, 255, 255), -1)
+                img_with_poses = cv2.addWeighted(img_with_poses, 0.7, overlay, 0.3, 0)
+                cv2.putText(img_with_poses, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            
+            # 不创建拼接图像，只使用姿态估计结果
+            concat_img = img_with_poses
+            
+            # 保存结果（如果提供了输出目录）
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                save_path = os.path.join(output_dir, "pose_estimation.png")
+                cv2.imwrite(save_path, cv2.cvtColor(concat_img, cv2.COLOR_RGB2BGR))
+                
+                if self.verbose:
+                    logger.info(f"姿态估计可视化结果已保存: {save_path}")
+            
+            return concat_img
+            
+        except Exception as e:
+            logger.error(f"姿态可视化失败: {e}")
+            return None
     
-    def _visualize_segmentation(self, detection, rgb_img, save_path):
+    def _visualize_seg(self, rgb_array, detections, output_dir):
         """可视化实例分割结果"""
-        # 生成颜色（使用distinctipy生成不同颜色）
-        import distinctipy
-        color = distinctipy.get_colors(1)[0]  # 获取第一个颜色
+        if len(detections) == 0:
+            if self.verbose:
+                logger.warning("没有实例分割结果，跳过分割可视化")
+            return
         
-        # 准备检测结果字典格式
-        det = {
-            'segmentation': detection['segmentation'],
-            'category_id': detection.get('category_id', 1)
-        }
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
         
-        # 使用run_inference_custom.py中的visualize函数
-        rgb = Image.fromarray(np.uint8(rgb_img)) if isinstance(rgb_img, np.ndarray) else rgb_img
-        # 复制原图用于处理
-        img = rgb.copy()
-        # 转换为灰度图再转RGB(为了后续叠加颜色时更明显)
-        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        alpha = 0.33  # 掩码叠加的透明度
+        # 创建可视化图像
+        vis_img = rgb_array.copy()
+        
+        # 确保RGB图像是uint8类型且范围在[0, 255]
+        if vis_img.dtype != np.uint8:
+            vis_img = (vis_img * 255).astype(np.uint8)
+        
+        # 获取掩码数量并生成足够的颜色
+        num_detections = len(detections.masks)
+        colors = generate_distinct_colors(max(num_detections, 6))  # 至少生成6种颜色
+        
+        for i in range(num_detections):
+            color = colors[i]
+            
+            # 获取掩码
+            mask = detections.masks[i].cpu().numpy()
+            
+            # 确保掩码是2D的
+            if len(mask.shape) == 3:
+                mask = mask[:, :, 0]
+            
+            # 使用更好的混合方式 - 先创建轮廓再叠加
+            # 找到掩码的轮廓
+            contours, _ = cv2.findContours((mask * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # 绘制轮廓
+            cv2.drawContours(vis_img, contours, -1, color, 2)
+            
+            # 半透明填充掩码区域
+            alpha = 0.3  # 降低透明度使图像更明亮
+            overlay = vis_img.copy()
+            overlay[mask > 0] = color
+            vis_img = cv2.addWeighted(vis_img, 1 - alpha, overlay, alpha, 0)
+            
+            # 绘制边界框（如果有）
+            if hasattr(detections, 'boxes'):
+                bbox = detections.boxes[i].cpu().numpy()
+                x1, y1, x2, y2 = bbox.astype(int)
+                cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
+            
+            # 添加标签
+            score = float(detections.scores[i].cpu().numpy()) if hasattr(detections, 'scores') else 0.0
+            label = f"Instance {i}: {score:.3f}"
+            
+            # 计算文本尺寸
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            label_x = 10
+            label_y = 30 + i * 30
+            
+            # 使用半透明白色背景而不是黑色背景
+            overlay = vis_img.copy()
+            cv2.rectangle(overlay, (label_x - 5, label_y - h), (label_x + w + 5, label_y + 5), (255, 255, 255), -1)
+            vis_img = cv2.addWeighted(vis_img, 0.7, overlay, 0.3, 0)
+            cv2.putText(vis_img, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # 保存结果
+        save_path = os.path.join(output_dir, "segmentation_result.png")
+        cv2.imwrite(save_path, cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR))
+        
+        if self.verbose:
+            logger.info(f"实例分割可视化结果已保存: {save_path}")
+    
 
-        # 将RLE编码的分割结果转换为二值掩码(0/1)
-        mask = rle_to_mask(det["segmentation"])
-        # 对掩码进行边缘检测(用于突出显示物体边界)
-        edge = canny(mask)
-        # 对边缘进行膨胀操作，使边界更清晰
-        edge = binary_dilation(edge, np.ones((2, 2)))
-        # 获取物体ID用于颜色生成
-        _ = det["category_id"]
-
-        # 将颜色值从0-1范围转换为0-255(图像像素范围)
-        r = int(255 * color[0])
-        g = int(255 * color[1])
-        b = int(255 * color[2])
-        
-        # 将掩码区域与颜色叠加(带透明度)
-        img[mask, 0] = alpha * r + (1 - alpha) * img[mask, 0]  # R通道
-        img[mask, 1] = alpha * g + (1 - alpha) * img[mask, 1]  # G通道
-        img[mask, 2] = alpha * b + (1 - alpha) * img[mask, 2]  # B通道
-        # 将边缘设置为白色(255)突出显示
-        img[edge, :] = 255
-        
-        # 保存处理后的图像并重新读取(确保格式正确)
-        img = Image.fromarray(np.uint8(img))
-        img.save(save_path)
-        prediction = Image.open(save_path)
-        
-        # 将原图和处理后的结果拼接
-        img = np.array(img)
-        concat = Image.new('RGB', (img.shape[1] + prediction.size[0], img.shape[0]))
-        concat.paste(rgb, (0, 0))  # 左侧粘贴原图
-        concat.paste(prediction, (img.shape[1], 0))  # 右侧粘贴带掩码的图
-        return concat
 
 
 # 使用示例
@@ -1133,7 +1359,8 @@ if __name__ == "__main__":
         det_score_thresh=0.2,
         reset_descriptors=True,
         visualization=False,
-        verbose=True
+        verbose=True,
+        save_results=False
     )
     
     # 计算初始化耗时
@@ -1141,7 +1368,7 @@ if __name__ == "__main__":
     print(f"初始化耗时: {init_time:.2f}秒")
     
     # 运行多次检测以评估性能
-    for i in range(3):
+    for i in range(1):
         # 记录检测开始时间
         detect_start_time = time.time()
         

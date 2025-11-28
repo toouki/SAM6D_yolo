@@ -7,7 +7,7 @@
 
 SAM-6D 是一个基于 Segment Anything Model 的零样本 6D 物体姿态估计框架。该项目能够从 RGB-D 图像中检测并估计物体的 6D 姿态（3D 位置 + 3D 旋转），无需针对特定物体进行训练。
 
-可使用Utralytics的无监督分割网络进行零样本检测，或全监督网络对物体进行训练。
+可使用Utralytics的无监督分割网络进行零样本检测（优化至2s以内），或全监督网络对物体进行训练（2FPS左右）。
 
 ## 核心功能
 
@@ -32,8 +32,9 @@ SAM-6D 是一个基于 Segment Anything Model 的零样本 6D 物体姿态估计
 
 ### 系统要求（测试可用）
 - Python 3.13
-- CUDA 12.8
-- Blender
+- CUDA 12.9
+- Pytorch 2.9
+- Blender 5.0
 
 ### 环境配置
 
